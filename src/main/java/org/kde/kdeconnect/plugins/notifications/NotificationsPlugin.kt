@@ -37,6 +37,7 @@ import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.put
 import org.kde.kdeconnect.NetworkPacket
 import org.kde.kdeconnect.helpers.AppsHelper.appNameLookup
+import org.kde.kdeconnect.helpers.PngHelper
 import org.kde.kdeconnect.plugins.Plugin
 import org.kde.kdeconnect.plugins.PluginFactory.LoadablePlugin
 import org.kde.kdeconnect.ui.PluginSettingsFragment
@@ -315,7 +316,7 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener 
     private fun getIconBytes(appIcon: Bitmap): ByteArray {
         val outStream = ByteArrayOutputStream()
         appIcon.compress(Bitmap.CompressFormat.PNG, 90, outStream)
-        return outStream.toByteArray()
+        return PngHelper.stripColorSpaceChunks(outStream.toByteArray())
     }
 
     private fun getIconHash(iconBytes: ByteArray): String {
