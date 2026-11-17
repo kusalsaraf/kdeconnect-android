@@ -78,4 +78,40 @@ class OtpExtractorTest {
         Assert.assertNull(OtpExtractor.find("Decode 482913 later"))
         Assert.assertNull(OtpExtractor.find("Pinterest 4821 posts"))
     }
+
+    @Test
+    fun cardNumberWithoutLetterPrefixIgnored() {
+        Assert.assertEquals(
+            "482913",
+            OtpExtractor.find("OTP for online purchase of Rs. 2,000.00 at AMAZON thru SBI Card ending 1234 is 482913."),
+        )
+        Assert.assertEquals(
+            "482913",
+            OtpExtractor.find("One-Time Password (OTP) for txn on Card ending 12345 is 482913."),
+        )
+    }
+
+    @Test
+    fun spaceSeparatedNumbersIgnored() {
+        Assert.assertNull(OtpExtractor.find("Never share your OTP/PIN. Call 1860 180 1290 for help."))
+    }
+
+    @Test
+    fun datesWithMonthNamesIgnored() {
+        Assert.assertNull(OtpExtractor.find("Your password was changed on 17 Nov 2026"))
+        Assert.assertEquals("482913", OtpExtractor.find("OTP generated on 17-Nov-2026 is 482913"))
+    }
+
+    @Test
+    fun textIsPreferredOverTitle() {
+        Assert.assertEquals(
+            "482913",
+            OtpExtractor.find(title = "Acme Corp 43210", text = "Your verification code for Acme is 482913"),
+        )
+    }
+
+    @Test
+    fun keywordOnlyInTitle() {
+        Assert.assertEquals("482913", OtpExtractor.find(title = "Verification code", text = "482913"))
+    }
 }

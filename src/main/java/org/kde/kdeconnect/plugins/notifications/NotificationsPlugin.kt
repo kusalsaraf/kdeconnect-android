@@ -57,8 +57,7 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener 
     private val postedNotifications = HashSet<String>()
     private val pendingIntents = HashMap<String, RepliableNotification>()
     private val pendingActions = mutableMapOf<String, MutableList<Notification.Action>>()
-    // Last one-time code sent to the other device's clipboard, per notification
-    private val copiedOtps = HashMap<String, String>()
+    private val otpTracker = OtpTracker()
     private var serviceReady = false
     private lateinit var keyguardManager: KeyguardManager
     private lateinit var mainHandler: Handler
@@ -94,7 +93,7 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener 
         notificationsIcons.clear()
         pendingIntents.clear()
         pendingActions.clear()
-        copiedOtps.clear()
+        otpTracker.clear()
 
         synchronized(postedNotificationsLock) {
             mainHandler.removeCallbacksAndMessages(null)
@@ -122,7 +121,7 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener 
         }
 
         pendingActions.remove(id)
-        copiedOtps.remove(id)
+        otpTracker.forget(id)
 
         if (!appDatabase.isEnabled(statusBarNotification.packageName)) {
             currentNotifications.remove(id)
@@ -310,20 +309,11 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener 
         }
         device.sendPacket(np)
 
-        if (isNewlyPosted) {
-            copyOtpToClipboard(key, np)
+        // Put a one-time code on the other device's clipboard. Uses the packet's title and text, so
+        // apps whose contents are blocked by privacy settings never match.
+        otpTracker.codeToSend(key, np.getStringOrNull("title"), np.getStringOrNull("text"), isNewlyPosted)?.let {
+            device.getPlugin<ClipboardPlugin>()?.propagateClipboard(it)
         }
-    }
-
-    // Puts a one-time code from the notification on the other device's clipboard. Uses the
-    // packet's title and text, so apps whose contents are blocked by privacy settings never match.
-    private fun copyOtpToClipboard(key: String, np: NetworkPacket) {
-        val content = listOfNotNull(np.getStringOrNull("title"), np.getStringOrNull("text")).joinToString("\n")
-        val otp = OtpExtractor.find(content) ?: return
-        if (copiedOtps.put(key, otp) == otp) {
-            return // Already sent for this notification
-        }
-        device.getPlugin<ClipboardPlugin>()?.propagateClipboard(otp)
     }
 
     private fun extractText(notification: Notification): String? {
