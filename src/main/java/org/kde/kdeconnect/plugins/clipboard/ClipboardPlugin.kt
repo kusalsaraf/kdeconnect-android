@@ -13,7 +13,6 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.widget.Toast
-import androidx.annotation.VisibleForTesting
 import androidx.core.content.ContextCompat
 import androidx.core.content.getSystemService
 import org.kde.kdeconnect.NetworkPacket
@@ -75,7 +74,6 @@ class ClipboardPlugin : Plugin() {
         }
     }
 
-    @VisibleForTesting
     fun propagateClipboard(content: String) {
         val np = NetworkPacket(PACKET_TYPE_CLIPBOARD)
         np["content"] = content
