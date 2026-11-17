@@ -53,3 +53,16 @@ for 96 px notification icons.
 - Full unit test suite + debug build.
 - On device: install build, re-enable the Mac's notifications plugin, post a
   test notification, confirm it shows on the Mac and `kdeconnectd` survives.
+
+## Addendum (2026-11-17): contact photos in call notifications
+
+The same crash hits incoming calls. `TelephonyPlugin` sends the caller's contact photo
+(`phoneThumbnail`) byte for byte. Every contact photo on the device is a JPEG carrying a
+456-byte ICC v4 profile written by Android's encoder. The macOS telephony plugin loads it
+into a QPixmap, and `toCGImage()` crashes. Proven with the bundled Qt 6.11: a JPEG with that
+profile exits with SIGTRAP, and the same JPEG without it converts fine. Crash report
+`kdeconnectd-2026-11-17-114011.ips` came 5 s after an incoming call from a contact with a photo.
+
+Fix: `ContactsHelper.photoId64Encoded` strips APP2 `ICC_PROFILE` segments through a new
+`JpegHelper.stripIccProfile` before base64-encoding. Other APP2 segments (such as MPF) are
+kept. Input that is not a well-formed JPEG is sent unchanged.

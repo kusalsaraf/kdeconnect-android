@@ -69,3 +69,18 @@
 - [ ] Mac: set `kdeconnect_notificationsEnabled=true` in `~/Library/Preferences/kdeconnect/92aa6183314a443780868cac67a8d70d/config`, delete cached icons in `$TMPDIR/kdeconnect_$USER/`, restart KDE Connect.
 - [ ] Post a test notification on the phone (`adb shell cmd notification post -t "KDE Connect test" kdc_test "Hello Mac"`); expect it on the Mac, `kdeconnectd` still running, no new `kdeconnectd-*.ips` crash report.
 - [ ] Run the Qt 6.11 repro against the newly received icon file in `$TMPDIR/kdeconnect_$USER/` → no crash.
+
+### Task 3: Strip ICC profiles from call contact photos
+
+**Files:** create `src/main/java/org/kde/kdeconnect/helpers/JpegHelper.kt` and
+`src/test/java/org/kde/kdeconnect/helpers/JpegHelperTest.kt`; modify
+`src/main/java/org/kde/kdeconnect/helpers/ContactsHelper.kt` (`photoId64Encoded`).
+
+- [ ] Failing tests: `removesIccProfileSegments` (strip(insertIcc(jpeg)) equals jpeg),
+  `keepsOtherApp2Segments` (MPF kept), `jpegWithoutIccIsUnchanged`,
+  `nonJpegInputIsReturnedUnchanged`, `truncatedJpegIsReturnedUnchanged`.
+- [ ] Implement `JpegHelper.stripIccProfile(jpeg: ByteArray): ByteArray`; tests pass.
+- [ ] `photoId64Encoded` reads the bytes, strips, then encodes with `Base64.DEFAULT` (same
+  output format as before).
+- [ ] Full suite plus `assembleDebug`. On device, a call from a contact with a photo
+  no longer crashes kdeconnectd.
