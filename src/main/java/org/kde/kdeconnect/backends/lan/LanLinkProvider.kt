@@ -13,7 +13,6 @@ import android.content.SharedPreferences.OnSharedPreferenceChangeListener
 import android.content.pm.PackageManager
 import android.net.Network
 import android.os.Build
-import android.os.SystemClock
 import android.util.Log
 import androidx.annotation.WorkerThread
 import androidx.core.content.ContextCompat
@@ -59,8 +58,9 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
 
     private val mdnsDiscovery = MdnsDiscovery(context, this)
 
-    private val lastConnectionTimeByDeviceId = ConcurrentHashMap<String, Long>()
-    private val lastConnectionTimeByIp = ConcurrentHashMap<InetAddress, Long>()
+    private val ipRateLimiter = RateLimiter<InetAddress>(MILLIS_DELAY_BETWEEN_CONNECTIONS_TO_SAME_DEVICE, MAX_RATE_LIMIT_ENTRIES)
+    // Keyed by address too: a device announcing from several addresses must not have its working one suppressed
+    private val deviceRateLimiter = RateLimiter<Pair<String, InetAddress>>(MILLIS_DELAY_BETWEEN_CONNECTIONS_TO_SAME_DEVICE, MAX_RATE_LIMIT_ENTRIES)
 
     private val customDevicePreferences: SharedPreferences =
         context.getSharedPreferences(context.packageName + "_preferences", Context.MODE_PRIVATE)
@@ -104,7 +104,7 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
         }
     }
 
-    fun unserializeReceivedIdentityPacket(message: String): Pair<NetworkPacket, Boolean>? {
+    fun unserializeReceivedIdentityPacket(message: String, address: InetAddress): Pair<NetworkPacket, Boolean>? {
         val identityPacket: NetworkPacket?
         try {
             identityPacket = NetworkPacket.unserialize(message)
@@ -125,8 +125,8 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
             return null
         }
 
-        if (rateLimitByDeviceId(deviceId)) {
-            Log.i("LanLinkProvider", "Discarding second packet from the same device $deviceId received too quickly")
+        if (deviceRateLimiter.shouldDiscard(deviceId to address)) {
+            Log.i("LanLinkProvider", "Discarding second packet from the same device $deviceId at $address received too quickly")
             return null
         }
 
@@ -145,7 +145,7 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
     private fun tcpPacketReceived(socket: Socket) {
         val address = socket.getInetAddress()
 
-        if (rateLimitByIp(address)) {
+        if (ipRateLimiter.shouldDiscard(address)) {
             Log.i("LanLinkProvider", "Discarding second TCP packet from the same ip $address received too quickly" )
             socket.closeSafe()
             return
@@ -169,7 +169,7 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
             return
         }
 
-        val (identityPacket, deviceTrusted)  = unserializeReceivedIdentityPacket(message) ?: run {
+        val (identityPacket, deviceTrusted)  = unserializeReceivedIdentityPacket(message, address) ?: run {
             socket.closeSafe()
             return
         }
@@ -196,38 +196,12 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
         return isPrivateAddress(address) || customDeviceAddresses.contains(address)
     }
 
-    fun rateLimitByIp(address: InetAddress): Boolean {
-        val now = SystemClock.elapsedRealtime()
-        val last = lastConnectionTimeByIp[address]
-        if (last != null && (last + MILLIS_DELAY_BETWEEN_CONNECTIONS_TO_SAME_DEVICE > now)) {
-            return true
-        }
-        lastConnectionTimeByIp[address] = now
-        if (lastConnectionTimeByIp.size > MAX_RATE_LIMIT_ENTRIES) {
-            lastConnectionTimeByIp.entries.removeIf { it.value + MILLIS_DELAY_BETWEEN_CONNECTIONS_TO_SAME_DEVICE < now }
-        }
-        return false
-    }
-
-    fun rateLimitByDeviceId(deviceId: String): Boolean {
-        val now = SystemClock.elapsedRealtime()
-        val last = lastConnectionTimeByDeviceId[deviceId]
-        if (last != null && (last + MILLIS_DELAY_BETWEEN_CONNECTIONS_TO_SAME_DEVICE > now)) {
-            return true
-        }
-        lastConnectionTimeByDeviceId[deviceId] = now
-        if (lastConnectionTimeByDeviceId.size > MAX_RATE_LIMIT_ENTRIES) {
-            lastConnectionTimeByDeviceId.entries.removeIf { it.value + MILLIS_DELAY_BETWEEN_CONNECTIONS_TO_SAME_DEVICE < now }
-        }
-        return false
-    }
-
     //I've received their broadcast and should connect to their TCP socket and send my identity.
     @WorkerThread
     private fun udpPacketReceived(packet: DatagramPacket) {
         val address = packet.address
 
-        if (rateLimitByIp(address)) {
+        if (ipRateLimiter.shouldDiscard(address)) {
             Log.i("LanLinkProvider", "Discarding second UDP packet from the same ip $address received too quickly")
             return
         }
@@ -239,7 +213,7 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
 
         val message = String(packet.data, 0, packet.length, Charsets.UTF_8)
 
-        val (identityPacket, deviceTrusted) = unserializeReceivedIdentityPacket(message)
+        val (identityPacket, deviceTrusted) = unserializeReceivedIdentityPacket(message, address)
             ?: return
 
         Log.i("KDE/LanLinkProvider", "Broadcast identity packet received from ${identityPacket.getString("deviceName")}")
@@ -250,9 +224,15 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
             return
         }
 
+        connectAndIdentify(address, tcpPort, identityPacket, deviceTrusted)
+    }
+
+    /** Connects to a device's TCP port, sends my identity and starts the TLS handshake. */
+    @WorkerThread
+    private fun connectAndIdentify(address: InetAddress, tcpPort: Int, identityPacket: NetworkPacket, deviceTrusted: Boolean) {
         var socket: Socket? = null
         try {
-            socket = SocketFactory.getDefault().createSocket(address, tcpPort)
+            socket = openSocket(InetSocketAddress(address, tcpPort))
             configureSocket(socket)
 
             val myDeviceInfo = DeviceHelper.getDeviceInfo(context)
@@ -267,11 +247,11 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
             identityPacketReceived(identityPacket, socket, ConnectionStarted.Remotely, deviceTrusted)
             socket = null // The SSL socket now owns the underlying socket, or it was rejected and closed.
         } catch (e: IOException) {
-            Log.e("LanLinkProvider", "Exception receiving incoming UDP connection", e)
+            Log.e("LanLinkProvider", "Exception connecting to $address:$tcpPort", e)
         } catch (e: CertificateException) {
-            Log.e("LanLinkProvider", "Exception receiving incoming UDP connection", e)
+            Log.e("LanLinkProvider", "Exception connecting to $address:$tcpPort", e)
         } catch (e: SerializationException) {
-            Log.e("LanLinkProvider", "Exception receiving incoming UDP connection", e)
+            Log.e("LanLinkProvider", "Exception connecting to $address:$tcpPort", e)
         } finally {
             socket?.closeSafe()
         }
@@ -675,6 +655,20 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
         private const val MAX_RATE_LIMIT_ENTRIES: Int = 255
         private const val MAX_UNPAIRED_CONNECTIONS: Int = 42
         private const val NETWORK_CHANGE_DEBOUNCE_MS: Long = 200
+        const val CONNECT_TIMEOUT_MS: Int = 5_000
+
+        /** Opens a TCP connection, giving up after [timeoutMs] instead of the OS default of a minute or more. */
+        @Throws(IOException::class)
+        fun openSocket(endpoint: InetSocketAddress, timeoutMs: Int = CONNECT_TIMEOUT_MS): Socket {
+            val socket = SocketFactory.getDefault().createSocket()
+            try {
+                socket.connect(endpoint, timeoutMs)
+            } catch (e: IOException) {
+                socket.closeSafe()
+                throw e
+            }
+            return socket
+        }
 
         @Throws(IOException::class)
         fun openServerSocketOnFreePort(minPort: Int): ServerSocket {
