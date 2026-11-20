@@ -12,10 +12,8 @@ import android.net.Uri
 import android.provider.ContactsContract
 import android.provider.ContactsContract.PhoneLookup
 import android.util.Base64
-import android.util.Base64OutputStream
 import android.util.Log
 import androidx.core.net.toUri
-import java.io.ByteArrayOutputStream
 
 /**
  * Helper object for contacts-related operations.
@@ -81,14 +79,10 @@ object ContactsHelper {
         photoId: String
     ): String? {
         val photoUri = photoId.toUri()
-        val encodedPhoto = ByteArrayOutputStream()
         return try {
-            context.contentResolver.openInputStream(photoUri)!!.use { input ->
-                Base64OutputStream(encodedPhoto, Base64.DEFAULT).use { output ->
-                    input.copyTo(output, 1024)
-                }
-            }
-            encodedPhoto.toString()
+            val photo = context.contentResolver.openInputStream(photoUri)!!.use { it.readBytes() }
+            // KDE Connect for macOS crashes on the ICC profile Android embeds in contact photos
+            Base64.encodeToString(JpegHelper.stripIccProfile(photo), Base64.DEFAULT)
         } catch (ex: Exception) {
             Log.e(TAG, "Error encoding photo", ex)
             null
