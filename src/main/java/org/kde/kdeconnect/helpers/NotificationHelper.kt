@@ -14,10 +14,15 @@ import androidx.preference.PreferenceManager
 import org.kde.kdeconnect_tp.R
 
 object NotificationHelper {
-    fun initializeChannels(context: Context) {
-        val persistentChannel = NotificationChannelCompat.Builder(Channels.PERSISTENT, NotificationManagerCompat.IMPORTANCE_MIN)
+    /** The channel of the notification shown while KDE Connect is on: silent, but with a status-bar icon. */
+    fun persistentChannel(context: Context): NotificationChannelCompat =
+        NotificationChannelCompat.Builder(Channels.PERSISTENT, NotificationManagerCompat.IMPORTANCE_LOW)
             .setName(context.getString(R.string.notification_channel_persistent))
+            .setShowBadge(false)
             .build()
+
+    fun initializeChannels(context: Context) {
+        val persistentChannel = persistentChannel(context)
         val defaultChannel = NotificationChannelCompat.Builder(Channels.DEFAULT, NotificationManagerCompat.IMPORTANCE_DEFAULT)
             .setName(context.getString(R.string.notification_channel_default))
             .build()
@@ -84,7 +89,8 @@ object NotificationHelper {
     }
 
     object Channels {
-        const val PERSISTENT: String = "persistent"
+        // Replaces "persistent" (IMPORTANCE_MIN): a channel's importance can't be raised once created
+        const val PERSISTENT: String = "persistent_status"
         const val DEFAULT: String = "default"
         const val MEDIA_CONTROL: String = "media_control"
 
