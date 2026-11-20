@@ -646,6 +646,8 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
         udpServer?.closeSafe()
         tcpServer = null
         udpServer = null
+        // Close the links too, so the other devices see us go right away
+        visibleDevices.values.forEach { it.disconnect() }
     }
 
     override val name: String = "LanLinkProvider"
