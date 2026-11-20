@@ -144,7 +144,14 @@ class BackgroundService : Service() {
         }.also {
             connectivityManager?.registerNetworkCallback(networkRequestBuilder.build(), it)
         }
+        // The link providers start in onStartCommand, once we know KDE Connect is switched on
+    }
 
+    /** Starts discovery and connections. Only runs while switched on, and only once per service instance. */
+    private fun startLinkProvidersIfNeeded() {
+        if (initialized) {
+            return
+        }
         registerLinkProviders()
         addConnectionListener(applicationInstance.connectionListener) // Link Providers need to be already registered
         for (linkProvider in linkProviders) {
@@ -276,6 +283,12 @@ class BackgroundService : Service() {
                     startForeground(FOREGROUND_NOTIFICATION_ID, createForegroundNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE)
                 } catch (e: IllegalStateException) { // To catch ForegroundServiceStartNotAllowedException
                     Log.w("BackgroundService", "Couldn't startForeground", e)
+                    if (!RunState.isOn(this)) {
+                        // No foreground obligation was taken on, so the service can simply stop
+                        stopSelf()
+                        return START_NOT_STICKY
+                    }
+                    startLinkProvidersIfNeeded()
                     return START_STICKY
                 }
             }
@@ -289,6 +302,7 @@ class BackgroundService : Service() {
             stopRunning(announce = false)
             return START_NOT_STICKY
         }
+        startLinkProvidersIfNeeded()
         if (intent != null && intent.getBooleanExtra("refresh", false)) {
             onNetworkChange(null)
         }
