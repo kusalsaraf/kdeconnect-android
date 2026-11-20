@@ -14,13 +14,6 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import androidx.core.content.getSystemService
-import org.kde.kdeconnect.helpers.ThreadHelper
-import org.kde.kdeconnect_tp.BuildConfig
-import java.io.BufferedReader
-import java.io.InputStreamReader
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
 
 class ClipboardListener {
     enum class ClipboardContentType {
@@ -49,22 +42,6 @@ class ClipboardListener {
         Handler(Looper.getMainLooper()).post {
             cm = context.getSystemService<ClipboardManager>()!!
             cm.addPrimaryClipChangedListener { this.onClipboardChanged() }
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && ClipboardPlugin.canSyncAutomatically(context)) {
-            ThreadHelper.runOnNewThread {
-                try {
-                    val timeStamp = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US).format(Date())
-                    // Listen only ClipboardService errors after now
-                    val logcatFilter = if (Build.VERSION.SDK_INT > Build.VERSION_CODES.VANILLA_ICE_CREAM) { "E ClipboardService" } else { "ClipboardService:E" }
-                    val process = Runtime.getRuntime().exec(arrayOf<String>("logcat", "-T", timeStamp, logcatFilter, "*:S"))
-                    val bufferedReader = BufferedReader(InputStreamReader(process.inputStream))
-                    bufferedReader.forEachLine { line ->
-                        if (line.contains(BuildConfig.APPLICATION_ID)) {
-                            context.startActivity(ClipboardFloatingActivity.getIntent(context, false))
-                        }
-                    }
-                } catch (_: Exception) { }
-            }
         }
     }
 

@@ -63,6 +63,7 @@ class KdeConnect : Application() {
         NotificationHelper.initializeChannels(this)
         LifecycleHelper.initializeObserver()
         loadRememberedDevicesFromSettings()
+        RunState.applyLastExitReason(this)
 
         if (BuildConfig.DEBUG && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             val vmPolicyBuilder = VmPolicy.Builder(StrictMode.getVmPolicy())

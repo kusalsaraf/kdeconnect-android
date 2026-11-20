@@ -13,14 +13,16 @@ import android.content.SharedPreferences.OnSharedPreferenceChangeListener
 import android.content.pm.PackageManager
 import android.net.Network
 import android.os.Build
-import android.os.SystemClock
+import android.os.PowerManager
 import android.util.Log
 import androidx.annotation.WorkerThread
 import androidx.core.content.ContextCompat
+import androidx.core.content.getSystemService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.SerializationException
 import org.kde.kdeconnect.DeviceInfo
@@ -59,8 +61,9 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
 
     private val mdnsDiscovery = MdnsDiscovery(context, this)
 
-    private val lastConnectionTimeByDeviceId = ConcurrentHashMap<String, Long>()
-    private val lastConnectionTimeByIp = ConcurrentHashMap<InetAddress, Long>()
+    private val ipRateLimiter = RateLimiter<InetAddress>(MILLIS_DELAY_BETWEEN_CONNECTIONS_TO_SAME_DEVICE, MAX_RATE_LIMIT_ENTRIES)
+    // Keyed by address too: a device announcing from several addresses must not have its working one suppressed
+    private val deviceRateLimiter = RateLimiter<Pair<String, InetAddress>>(MILLIS_DELAY_BETWEEN_CONNECTIONS_TO_SAME_DEVICE, MAX_RATE_LIMIT_ENTRIES)
 
     private val customDevicePreferences: SharedPreferences =
         context.getSharedPreferences(context.packageName + "_preferences", Context.MODE_PRIVATE)
@@ -89,6 +92,9 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
 
     private val networkChangeScope = CoroutineScope(Dispatchers.IO)
     private var networkChangeJob: Job? = null
+    private var directConnectRetryJob: Job? = null
+    private var directConnectJob: Job? = null
+    private val directConnectsInFlight: MutableSet<String> = ConcurrentHashMap.newKeySet()
     @Volatile
     private var isStopped = true
 
@@ -104,7 +110,7 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
         }
     }
 
-    fun unserializeReceivedIdentityPacket(message: String): Pair<NetworkPacket, Boolean>? {
+    fun unserializeReceivedIdentityPacket(message: String, address: InetAddress): Pair<NetworkPacket, Boolean>? {
         val identityPacket: NetworkPacket?
         try {
             identityPacket = NetworkPacket.unserialize(message)
@@ -125,8 +131,8 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
             return null
         }
 
-        if (rateLimitByDeviceId(deviceId)) {
-            Log.i("LanLinkProvider", "Discarding second packet from the same device $deviceId received too quickly")
+        if (deviceRateLimiter.shouldDiscard(deviceId to address)) {
+            Log.i("LanLinkProvider", "Discarding second packet from the same device $deviceId at $address received too quickly")
             return null
         }
 
@@ -145,7 +151,7 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
     private fun tcpPacketReceived(socket: Socket) {
         val address = socket.getInetAddress()
 
-        if (rateLimitByIp(address)) {
+        if (ipRateLimiter.shouldDiscard(address)) {
             Log.i("LanLinkProvider", "Discarding second TCP packet from the same ip $address received too quickly" )
             socket.closeSafe()
             return
@@ -169,7 +175,7 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
             return
         }
 
-        val (identityPacket, deviceTrusted)  = unserializeReceivedIdentityPacket(message) ?: run {
+        val (identityPacket, deviceTrusted)  = unserializeReceivedIdentityPacket(message, address) ?: run {
             socket.closeSafe()
             return
         }
@@ -196,38 +202,12 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
         return isPrivateAddress(address) || customDeviceAddresses.contains(address)
     }
 
-    fun rateLimitByIp(address: InetAddress): Boolean {
-        val now = SystemClock.elapsedRealtime()
-        val last = lastConnectionTimeByIp[address]
-        if (last != null && (last + MILLIS_DELAY_BETWEEN_CONNECTIONS_TO_SAME_DEVICE > now)) {
-            return true
-        }
-        lastConnectionTimeByIp[address] = now
-        if (lastConnectionTimeByIp.size > MAX_RATE_LIMIT_ENTRIES) {
-            lastConnectionTimeByIp.entries.removeIf { it.value + MILLIS_DELAY_BETWEEN_CONNECTIONS_TO_SAME_DEVICE < now }
-        }
-        return false
-    }
-
-    fun rateLimitByDeviceId(deviceId: String): Boolean {
-        val now = SystemClock.elapsedRealtime()
-        val last = lastConnectionTimeByDeviceId[deviceId]
-        if (last != null && (last + MILLIS_DELAY_BETWEEN_CONNECTIONS_TO_SAME_DEVICE > now)) {
-            return true
-        }
-        lastConnectionTimeByDeviceId[deviceId] = now
-        if (lastConnectionTimeByDeviceId.size > MAX_RATE_LIMIT_ENTRIES) {
-            lastConnectionTimeByDeviceId.entries.removeIf { it.value + MILLIS_DELAY_BETWEEN_CONNECTIONS_TO_SAME_DEVICE < now }
-        }
-        return false
-    }
-
     //I've received their broadcast and should connect to their TCP socket and send my identity.
     @WorkerThread
     private fun udpPacketReceived(packet: DatagramPacket) {
         val address = packet.address
 
-        if (rateLimitByIp(address)) {
+        if (ipRateLimiter.shouldDiscard(address)) {
             Log.i("LanLinkProvider", "Discarding second UDP packet from the same ip $address received too quickly")
             return
         }
@@ -239,7 +219,7 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
 
         val message = String(packet.data, 0, packet.length, Charsets.UTF_8)
 
-        val (identityPacket, deviceTrusted) = unserializeReceivedIdentityPacket(message)
+        val (identityPacket, deviceTrusted) = unserializeReceivedIdentityPacket(message, address)
             ?: return
 
         Log.i("KDE/LanLinkProvider", "Broadcast identity packet received from ${identityPacket.getString("deviceName")}")
@@ -250,9 +230,15 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
             return
         }
 
+        connectAndIdentify(address, tcpPort, identityPacket, deviceTrusted)
+    }
+
+    /** Connects to a device's TCP port, sends my identity and starts the TLS handshake. */
+    @WorkerThread
+    private fun connectAndIdentify(address: InetAddress, tcpPort: Int, identityPacket: NetworkPacket, deviceTrusted: Boolean) {
         var socket: Socket? = null
         try {
-            socket = SocketFactory.getDefault().createSocket(address, tcpPort)
+            socket = openSocket(InetSocketAddress(address, tcpPort))
             configureSocket(socket)
 
             val myDeviceInfo = DeviceHelper.getDeviceInfo(context)
@@ -267,11 +253,11 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
             identityPacketReceived(identityPacket, socket, ConnectionStarted.Remotely, deviceTrusted)
             socket = null // The SSL socket now owns the underlying socket, or it was rejected and closed.
         } catch (e: IOException) {
-            Log.e("LanLinkProvider", "Exception receiving incoming UDP connection", e)
+            Log.e("LanLinkProvider", "Exception connecting to $address:$tcpPort", e)
         } catch (e: CertificateException) {
-            Log.e("LanLinkProvider", "Exception receiving incoming UDP connection", e)
+            Log.e("LanLinkProvider", "Exception connecting to $address:$tcpPort", e)
         } catch (e: SerializationException) {
-            Log.e("LanLinkProvider", "Exception receiving incoming UDP connection", e)
+            Log.e("LanLinkProvider", "Exception connecting to $address:$tcpPort", e)
         } finally {
             socket?.closeSafe()
         }
@@ -279,7 +265,7 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
 
     private fun configureSocket(socket: Socket) {
         try {
-            socket.setKeepAlive(true)
+            TcpKeepAlive.apply(socket)
             socket.setSoTimeout(10 * 1000)
         } catch (e: SocketException) {
             Log.e("LanLink", "Exception", e)
@@ -369,6 +355,11 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
                     val certificate = event.peerCertificates[0]
                     val deviceInfo = DeviceInfo.fromIdentityPacketAndCert(secureIdentityPacket, certificate)
                     Log.i("KDE/LanLinkProvider", "Handshake as $mode successful with ${deviceInfo.name} secured with ${event.cipherSuite}")
+                    if (deviceTrusted) {
+                        val outgoing = connectionStarted == ConnectionStarted.Remotely // we opened the TCP connection
+                        val port = LastKnownAddress.rememberedPort(outgoing, socket.port, identityPacket.getIntOrNull("tcpPort"))
+                        LastKnownAddress.save(TrustedDevices.getDeviceSettings(context, deviceId), socket.inetAddress, port)
+                    }
                     addOrUpdateLink(sslSocket, deviceInfo)
                 } catch (e: SerializationException) {
                     Log.e("KDE/LanLinkProvider", "Remote device doesn't correctly implement protocol version 8", e)
@@ -401,6 +392,12 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
     @WorkerThread
     @Synchronized
     private fun addOrUpdateLink(socket: SSLSocket, deviceInfo: DeviceInfo) {
+        if (isStopped) {
+            // A handshake that finished after we were switched off must not reconnect us
+            Log.i("KDE/LanLinkProvider", "Stopped, not adding a link for ${deviceInfo.id}")
+            socket.closeSafe()
+            return
+        }
         var linkCreated = false
         val link = visibleDevices.computeIfAbsent(deviceInfo.id) {
             linkCreated = true
@@ -595,6 +592,47 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
         }
 
         broadcastUdpIdentityPacket(null)
+        connectToKnownDevicesSoon()
+
+        directConnectRetryJob?.cancel()
+        directConnectRetryJob = networkChangeScope.launch {
+            // The delay doesn't advance while the phone sleeps, and no attempt is made with the screen off
+            while (isActive) {
+                delay(DIRECT_CONNECT_RETRY_MS)
+                if (!isStopped && context.getSystemService<PowerManager>()?.isInteractive == true) {
+                    connectToKnownDevices()
+                }
+            }
+        }
+    }
+
+    /**
+     * Connects directly to paired devices that aren't connected, at the address they were last connected on.
+     * This doesn't rely on them announcing themselves, which a sleeping or long-running computer may not do.
+     */
+    fun connectToKnownDevices() {
+        if (isStopped || !TrustedNetworkHelper.isTrustedNetwork(context)) {
+            return
+        }
+        val targets = directConnectTargets(
+            TrustedDevices.getAllTrustedDevices(context),
+            visibleDevices.keys,
+            directConnectsInFlight,
+        ) { LastKnownAddress.load(TrustedDevices.getDeviceSettings(context, it)) }
+        for ((deviceId, endpoint) in targets) {
+            val protocolVersion = DeviceInfo.loadProtocolVersionFromSettings(context, deviceId)
+            if (protocolVersion < MIN_DIRECT_CONNECT_PROTOCOL_VERSION || !directConnectsInFlight.add(deviceId)) {
+                continue
+            }
+            ThreadHelper.runOnNewThread {
+                try {
+                    Log.i("KDE/LanLinkProvider", "Connecting directly to $deviceId at $endpoint")
+                    connectAndIdentify(endpoint.address, endpoint.port, directConnectIdentity(deviceId, protocolVersion), deviceTrusted = true)
+                } finally {
+                    directConnectsInFlight.remove(deviceId)
+                }
+            }
+        }
     }
 
     @Synchronized
@@ -632,10 +670,27 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
             mdnsDiscovery.stopDiscovering()
             mdnsDiscovery.startDiscovering()
         }
+        connectToKnownDevicesSoon()
+    }
+
+    /**
+     * Gives devices that answer our announcement time to connect first: a direct connection made at the same
+     * moment can cross theirs, and each side then closes the socket the other is using.
+     */
+    private fun connectToKnownDevicesSoon() {
+        directConnectJob?.cancel()
+        directConnectJob = networkChangeScope.launch {
+            delay(DIRECT_CONNECT_DELAY_MS)
+            connectToKnownDevices()
+        }
     }
 
     override fun onStop() {
         //Log.i("KDE/LanLinkProvider", "onStop");
+        directConnectRetryJob?.cancel()
+        directConnectRetryJob = null
+        directConnectJob?.cancel()
+        directConnectJob = null
         isStopped = true
         customDevicePreferences.unregisterOnSharedPreferenceChangeListener(customDeviceListener)
         synchronized(mdnsDiscovery) {
@@ -646,6 +701,8 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
         udpServer?.closeSafe()
         tcpServer = null
         udpServer = null
+        // Close the links too, so the other devices see us go right away
+        visibleDevices.values.forEach { it.disconnect() }
     }
 
     override val name: String = "LanLinkProvider"
@@ -673,6 +730,46 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
         private const val MAX_RATE_LIMIT_ENTRIES: Int = 255
         private const val MAX_UNPAIRED_CONNECTIONS: Int = 42
         private const val NETWORK_CHANGE_DEBOUNCE_MS: Long = 200
+        const val CONNECT_TIMEOUT_MS: Int = 5_000
+        const val DIRECT_CONNECT_RETRY_MS: Long = 30_000L
+        private const val DIRECT_CONNECT_DELAY_MS: Long = 2_500L
+        // Older protocols take the identity from before encryption, which a direct connection doesn't have
+        private const val MIN_DIRECT_CONNECT_PROTOCOL_VERSION = 8
+
+        /**
+         * The identity used as the remote device's before a direct connection. From protocol version 8 on, the
+         * real identity is exchanged once the connection is encrypted, so only the id and version are needed.
+         */
+        fun directConnectIdentity(deviceId: String, protocolVersion: Int): NetworkPacket =
+            NetworkPacket(NetworkPacket.PACKET_TYPE_IDENTITY).also { np ->
+                np["deviceId"] = deviceId
+                np["protocolVersion"] = protocolVersion
+            }
+
+        /** Paired devices worth a direct connection: not connected, no attempt running, and a known address. */
+        fun directConnectTargets(
+            trustedDeviceIds: List<String>,
+            connectedDeviceIds: Set<String>,
+            inFlight: Set<String>,
+            knownAddress: (String) -> InetSocketAddress?,
+        ): Map<String, InetSocketAddress> =
+            trustedDeviceIds
+                .filter { it !in connectedDeviceIds && it !in inFlight }
+                .mapNotNull { id -> knownAddress(id)?.let { id to it } }
+                .toMap()
+
+        /** Opens a TCP connection, giving up after [timeoutMs] instead of the OS default of a minute or more. */
+        @Throws(IOException::class)
+        fun openSocket(endpoint: InetSocketAddress, timeoutMs: Int = CONNECT_TIMEOUT_MS): Socket {
+            val socket = SocketFactory.getDefault().createSocket()
+            try {
+                socket.connect(endpoint, timeoutMs)
+            } catch (e: IOException) {
+                socket.closeSafe()
+                throw e
+            }
+            return socket
+        }
 
         @Throws(IOException::class)
         fun openServerSocketOnFreePort(minPort: Int): ServerSocket {
