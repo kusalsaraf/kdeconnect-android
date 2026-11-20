@@ -40,6 +40,7 @@ import org.kde.kdeconnect.helpers.AppsHelper.appNameLookup
 import org.kde.kdeconnect.helpers.PngHelper
 import org.kde.kdeconnect.plugins.Plugin
 import org.kde.kdeconnect.plugins.PluginFactory.LoadablePlugin
+import org.kde.kdeconnect.plugins.clipboard.ClipboardPlugin
 import org.kde.kdeconnect.ui.PluginSettingsFragment
 import org.kde.kdeconnect.ui.StartActivityAlertDialogFragment
 import org.kde.kdeconnect_tp.R
@@ -56,6 +57,7 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener 
     private val postedNotifications = HashSet<String>()
     private val pendingIntents = HashMap<String, RepliableNotification>()
     private val pendingActions = mutableMapOf<String, MutableList<Notification.Action>>()
+    private val otpTracker = OtpTracker()
     private var serviceReady = false
     private lateinit var keyguardManager: KeyguardManager
     private lateinit var mainHandler: Handler
@@ -91,6 +93,7 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener 
         notificationsIcons.clear()
         pendingIntents.clear()
         pendingActions.clear()
+        otpTracker.clear()
 
         synchronized(postedNotificationsLock) {
             mainHandler.removeCallbacksAndMessages(null)
@@ -118,6 +121,7 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener 
         }
 
         pendingActions.remove(id)
+        otpTracker.forget(id)
 
         if (!appDatabase.isEnabled(statusBarNotification.packageName)) {
             currentNotifications.remove(id)
@@ -157,7 +161,7 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener 
                         return@Runnable
                     }
                 }
-                sendNotification(statusBarNotification, silent)
+                sendNotification(statusBarNotification, silent, isNewlyPosted = true)
             })
             delayedNotification.obj = key
             mainHandler.sendMessageDelayed(delayedNotification, NOTIFICATION_SYNC_DELAY_MS)
@@ -172,7 +176,8 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener 
     // that we are sending in response to a request command, or new ones while the screen is on if the user asked so
     private fun sendNotification(
         statusBarNotification: StatusBarNotification,
-        silent: Boolean
+        silent: Boolean,
+        isNewlyPosted: Boolean = false,
     ) {
         val notification = statusBarNotification.notification
 
@@ -303,6 +308,12 @@ class NotificationsPlugin : Plugin(), NotificationReceiver.NotificationListener 
             }
         }
         device.sendPacket(np)
+
+        // Put a one-time code on the other device's clipboard. Uses the packet's title and text, so
+        // apps whose contents are blocked by privacy settings never match.
+        otpTracker.codeToSend(key, np.getStringOrNull("title"), np.getStringOrNull("text"), isNewlyPosted)?.let {
+            device.getPlugin<ClipboardPlugin>()?.propagateClipboard(it)
+        }
     }
 
     private fun extractText(notification: Notification): String? {
