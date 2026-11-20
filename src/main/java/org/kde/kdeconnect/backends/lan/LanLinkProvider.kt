@@ -93,6 +93,7 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
     private val networkChangeScope = CoroutineScope(Dispatchers.IO)
     private var networkChangeJob: Job? = null
     private var directConnectRetryJob: Job? = null
+    private var directConnectJob: Job? = null
     private val directConnectsInFlight: MutableSet<String> = ConcurrentHashMap.newKeySet()
     @Volatile
     private var isStopped = true
@@ -591,7 +592,7 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
         }
 
         broadcastUdpIdentityPacket(null)
-        connectToKnownDevices()
+        connectToKnownDevicesSoon()
 
         directConnectRetryJob?.cancel()
         directConnectRetryJob = networkChangeScope.launch {
@@ -669,13 +670,27 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
             mdnsDiscovery.stopDiscovering()
             mdnsDiscovery.startDiscovering()
         }
-        connectToKnownDevices()
+        connectToKnownDevicesSoon()
+    }
+
+    /**
+     * Gives devices that answer our announcement time to connect first: a direct connection made at the same
+     * moment can cross theirs, and each side then closes the socket the other is using.
+     */
+    private fun connectToKnownDevicesSoon() {
+        directConnectJob?.cancel()
+        directConnectJob = networkChangeScope.launch {
+            delay(DIRECT_CONNECT_DELAY_MS)
+            connectToKnownDevices()
+        }
     }
 
     override fun onStop() {
         //Log.i("KDE/LanLinkProvider", "onStop");
         directConnectRetryJob?.cancel()
         directConnectRetryJob = null
+        directConnectJob?.cancel()
+        directConnectJob = null
         isStopped = true
         customDevicePreferences.unregisterOnSharedPreferenceChangeListener(customDeviceListener)
         synchronized(mdnsDiscovery) {
@@ -717,6 +732,7 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
         private const val NETWORK_CHANGE_DEBOUNCE_MS: Long = 200
         const val CONNECT_TIMEOUT_MS: Int = 5_000
         const val DIRECT_CONNECT_RETRY_MS: Long = 30_000L
+        private const val DIRECT_CONNECT_DELAY_MS: Long = 2_500L
         // Older protocols take the identity from before encryption, which a direct connection doesn't have
         private const val MIN_DIRECT_CONNECT_PROTOCOL_VERSION = 8
 
