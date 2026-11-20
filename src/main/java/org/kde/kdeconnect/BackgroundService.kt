@@ -196,7 +196,8 @@ class BackgroundService : Service() {
             setSmallIcon(R.drawable.ic_notification)
             setOngoing(true)
             setContentIntent(pi)
-            setPriority(NotificationCompat.PRIORITY_MIN) //MIN so it's not shown in the status bar before Oreo, on Oreo it will be bumped to LOW
+            setDeleteIntent(notificationDismissedIntent(this@BackgroundService))
+            setPriority(NotificationCompat.PRIORITY_LOW) // Silent, but with a status-bar icon so it's clear KDE Connect is on
             setShowWhen(false)
             setForegroundServiceBehavior(NotificationCompat.FOREGROUND_SERVICE_IMMEDIATE)
             setAutoCancel(false)
@@ -327,6 +328,17 @@ class BackgroundService : Service() {
         private const val FOREGROUND_NOTIFICATION_ID = 1
 
         const val ACTION_QUIT = "org.kde.kdeconnect.QUIT"
+        /** Sent when the user dismisses the notification; any start command re-posts it while switched on. */
+        const val ACTION_SHOW_NOTIFICATION = "org.kde.kdeconnect.SHOW_NOTIFICATION"
+
+        /**
+         * What Android sends when the user swipes the notification away or clears all: a request to show it again,
+         * since Android 14+ lets users dismiss a foreground service's notification while the service keeps running.
+         */
+        fun notificationDismissedIntent(context: Context): PendingIntent {
+            val intent = Intent(context, BackgroundService::class.java).setAction(ACTION_SHOW_NOTIFICATION)
+            return PendingIntent.getService(context, 0, intent, UPDATE_IMMUTABLE_FLAGS)
+        }
 
         var instance: BackgroundService? = null
             private set

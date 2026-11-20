@@ -19,6 +19,7 @@ import io.mockk.unmockkAll
 import io.mockk.verify
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -62,6 +63,37 @@ class BackgroundServiceTest {
         assertEquals(Service.START_NOT_STICKY, result)
         assertTrue(shadowOf(controller.get()).isStoppedBySelf)
         verify(exactly = 0) { anyConstructed<LanLinkProvider>().onStart() }
+    }
+
+    @Test
+    fun dismissingTheNotificationAsksTheServiceToShowItAgain() {
+        val requested = shadowOf(BackgroundService.notificationDismissedIntent(application))
+
+        assertTrue(requested.isServiceIntent)
+        assertEquals(BackgroundService::class.java.name, requested.savedIntent.component?.className)
+        assertEquals(BackgroundService.ACTION_SHOW_NOTIFICATION, requested.savedIntent.action)
+    }
+
+    @Test
+    fun showRequestWhileOnKeepsRunning() {
+        // Building the notification needs app strings, which Robolectric can't load here; on Android 8+
+        // the start command always re-posts it via startForeground()
+        RunState.setOn(application, true)
+        val controller = Robolectric.buildService(BackgroundService::class.java, Intent()).create()
+        val result = controller.get().onStartCommand(Intent(BackgroundService.ACTION_SHOW_NOTIFICATION), 0, 1)
+
+        assertEquals(Service.START_STICKY, result)
+        assertFalse(shadowOf(controller.get()).isStoppedBySelf)
+        controller.destroy()
+    }
+
+    @Test
+    fun showRequestWhileOffStops() {
+        val controller = Robolectric.buildService(BackgroundService::class.java, Intent()).create()
+        val result = controller.get().onStartCommand(Intent(BackgroundService.ACTION_SHOW_NOTIFICATION), 0, 1)
+
+        assertEquals(Service.START_NOT_STICKY, result)
+        assertTrue(shadowOf(controller.get()).isStoppedBySelf)
     }
 
     @Test
