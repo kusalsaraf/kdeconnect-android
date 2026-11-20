@@ -33,6 +33,7 @@ import org.kde.kdeconnect.backends.bluetooth.BluetoothLinkProvider
 import org.kde.kdeconnect.backends.lan.LanLinkProvider
 import org.kde.kdeconnect.helpers.NotificationHelper
 import org.kde.kdeconnect.plugins.clipboard.ClipboardFloatingActivity
+import org.kde.kdeconnect.plugins.clipboard.ClipboardLogWatcher
 import org.kde.kdeconnect.plugins.clipboard.ClipboardPlugin
 import org.kde.kdeconnect.plugins.runcommand.RunCommandActivity
 import org.kde.kdeconnect.plugins.runcommand.RunCommandPlugin
@@ -326,6 +327,8 @@ class BackgroundService : Service() {
         fun ForceRefreshConnections(context: Context) {
             Log.d(TAG, "ForceRefreshConnections")
             RunState.setOn(context, true)
+            // Started here, while the app is on screen, so Android's log access prompt can be shown
+            ClipboardLogWatcher.ensureRunning(context)
             refreshConnections(context)
         }
 

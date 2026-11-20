@@ -42,6 +42,7 @@ class ClipboardFloatingActivity : AppCompatActivity() {
         if (hasFocus) {
             // We are now sure that clipboard can be accessed from here.
             ClipboardListener.instance(this).onClipboardChanged()
+            ClipboardLogWatcher.launchGuard.launchFinished()
             if (shouldShowToast()) {
                 Toast.makeText(this, R.string.pref_plugin_clipboard_sent, Toast.LENGTH_SHORT).show()
             }
@@ -58,6 +59,11 @@ class ClipboardFloatingActivity : AppCompatActivity() {
                 WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL
 
         window.attributes = wlp
+    }
+
+    override fun onDestroy() {
+        ClipboardLogWatcher.launchGuard.launchFinished()
+        super.onDestroy()
     }
 
     private fun shouldShowToast(): Boolean {
