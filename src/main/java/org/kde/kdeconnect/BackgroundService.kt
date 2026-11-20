@@ -319,8 +319,26 @@ class BackgroundService : Service() {
             startService(context, intent)
         }
 
+        /**
+         * The user is using the app: switches KDE Connect on and refreshes connections, starting the service if needed.
+         * Only screens the user opened should call this; automatic triggers use [RefreshConnectionsIfOn].
+         */
         fun ForceRefreshConnections(context: Context) {
             Log.d(TAG, "ForceRefreshConnections")
+            RunState.setOn(context, true)
+            refreshConnections(context)
+        }
+
+        /** Refreshes connections, starting the service if needed, but only while KDE Connect is switched on. */
+        fun RefreshConnectionsIfOn(context: Context) {
+            if (!RunState.isOn(context)) {
+                Log.d(TAG, "Not refreshing connections, KDE Connect is switched off")
+                return
+            }
+            refreshConnections(context)
+        }
+
+        private fun refreshConnections(context: Context) {
             val service = instance
             if (initialized && service != null) {
                 service.onNetworkChange(null)
