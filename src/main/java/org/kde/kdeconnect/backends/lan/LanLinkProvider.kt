@@ -13,13 +13,16 @@ import android.content.SharedPreferences.OnSharedPreferenceChangeListener
 import android.content.pm.PackageManager
 import android.net.Network
 import android.os.Build
+import android.os.PowerManager
 import android.util.Log
 import androidx.annotation.WorkerThread
 import androidx.core.content.ContextCompat
+import androidx.core.content.getSystemService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.serialization.SerializationException
 import org.kde.kdeconnect.DeviceInfo
@@ -89,6 +92,8 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
 
     private val networkChangeScope = CoroutineScope(Dispatchers.IO)
     private var networkChangeJob: Job? = null
+    private var directConnectRetryJob: Job? = null
+    private val directConnectsInFlight: MutableSet<String> = ConcurrentHashMap.newKeySet()
     @Volatile
     private var isStopped = true
 
@@ -349,6 +354,11 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
                     val certificate = event.peerCertificates[0]
                     val deviceInfo = DeviceInfo.fromIdentityPacketAndCert(secureIdentityPacket, certificate)
                     Log.i("KDE/LanLinkProvider", "Handshake as $mode successful with ${deviceInfo.name} secured with ${event.cipherSuite}")
+                    if (deviceTrusted) {
+                        val outgoing = connectionStarted == ConnectionStarted.Remotely // we opened the TCP connection
+                        val port = LastKnownAddress.rememberedPort(outgoing, socket.port, identityPacket.getIntOrNull("tcpPort"))
+                        LastKnownAddress.save(TrustedDevices.getDeviceSettings(context, deviceId), socket.inetAddress, port)
+                    }
                     addOrUpdateLink(sslSocket, deviceInfo)
                 } catch (e: SerializationException) {
                     Log.e("KDE/LanLinkProvider", "Remote device doesn't correctly implement protocol version 8", e)
@@ -381,6 +391,12 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
     @WorkerThread
     @Synchronized
     private fun addOrUpdateLink(socket: SSLSocket, deviceInfo: DeviceInfo) {
+        if (isStopped) {
+            // A handshake that finished after we were switched off must not reconnect us
+            Log.i("KDE/LanLinkProvider", "Stopped, not adding a link for ${deviceInfo.id}")
+            socket.closeSafe()
+            return
+        }
         var linkCreated = false
         val link = visibleDevices.computeIfAbsent(deviceInfo.id) {
             linkCreated = true
@@ -575,6 +591,47 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
         }
 
         broadcastUdpIdentityPacket(null)
+        connectToKnownDevices()
+
+        directConnectRetryJob?.cancel()
+        directConnectRetryJob = networkChangeScope.launch {
+            // The delay doesn't advance while the phone sleeps, and no attempt is made with the screen off
+            while (isActive) {
+                delay(DIRECT_CONNECT_RETRY_MS)
+                if (!isStopped && context.getSystemService<PowerManager>()?.isInteractive == true) {
+                    connectToKnownDevices()
+                }
+            }
+        }
+    }
+
+    /**
+     * Connects directly to paired devices that aren't connected, at the address they were last connected on.
+     * This doesn't rely on them announcing themselves, which a sleeping or long-running computer may not do.
+     */
+    fun connectToKnownDevices() {
+        if (isStopped || !TrustedNetworkHelper.isTrustedNetwork(context)) {
+            return
+        }
+        val targets = directConnectTargets(
+            TrustedDevices.getAllTrustedDevices(context),
+            visibleDevices.keys,
+            directConnectsInFlight,
+        ) { LastKnownAddress.load(TrustedDevices.getDeviceSettings(context, it)) }
+        for ((deviceId, endpoint) in targets) {
+            val protocolVersion = DeviceInfo.loadProtocolVersionFromSettings(context, deviceId)
+            if (protocolVersion < MIN_DIRECT_CONNECT_PROTOCOL_VERSION || !directConnectsInFlight.add(deviceId)) {
+                continue
+            }
+            ThreadHelper.runOnNewThread {
+                try {
+                    Log.i("KDE/LanLinkProvider", "Connecting directly to $deviceId at $endpoint")
+                    connectAndIdentify(endpoint.address, endpoint.port, directConnectIdentity(deviceId, protocolVersion), deviceTrusted = true)
+                } finally {
+                    directConnectsInFlight.remove(deviceId)
+                }
+            }
+        }
     }
 
     @Synchronized
@@ -612,10 +669,13 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
             mdnsDiscovery.stopDiscovering()
             mdnsDiscovery.startDiscovering()
         }
+        connectToKnownDevices()
     }
 
     override fun onStop() {
         //Log.i("KDE/LanLinkProvider", "onStop");
+        directConnectRetryJob?.cancel()
+        directConnectRetryJob = null
         isStopped = true
         customDevicePreferences.unregisterOnSharedPreferenceChangeListener(customDeviceListener)
         synchronized(mdnsDiscovery) {
@@ -656,6 +716,31 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
         private const val MAX_UNPAIRED_CONNECTIONS: Int = 42
         private const val NETWORK_CHANGE_DEBOUNCE_MS: Long = 200
         const val CONNECT_TIMEOUT_MS: Int = 5_000
+        const val DIRECT_CONNECT_RETRY_MS: Long = 30_000L
+        // Older protocols take the identity from before encryption, which a direct connection doesn't have
+        private const val MIN_DIRECT_CONNECT_PROTOCOL_VERSION = 8
+
+        /**
+         * The identity used as the remote device's before a direct connection. From protocol version 8 on, the
+         * real identity is exchanged once the connection is encrypted, so only the id and version are needed.
+         */
+        fun directConnectIdentity(deviceId: String, protocolVersion: Int): NetworkPacket =
+            NetworkPacket(NetworkPacket.PACKET_TYPE_IDENTITY).also { np ->
+                np["deviceId"] = deviceId
+                np["protocolVersion"] = protocolVersion
+            }
+
+        /** Paired devices worth a direct connection: not connected, no attempt running, and a known address. */
+        fun directConnectTargets(
+            trustedDeviceIds: List<String>,
+            connectedDeviceIds: Set<String>,
+            inFlight: Set<String>,
+            knownAddress: (String) -> InetSocketAddress?,
+        ): Map<String, InetSocketAddress> =
+            trustedDeviceIds
+                .filter { it !in connectedDeviceIds && it !in inFlight }
+                .mapNotNull { id -> knownAddress(id)?.let { id to it } }
+                .toMap()
 
         /** Opens a TCP connection, giving up after [timeoutMs] instead of the OS default of a minute or more. */
         @Throws(IOException::class)
