@@ -8,6 +8,7 @@ package org.kde.kdeconnect
 import android.app.Application
 import android.content.Intent
 import android.net.wifi.WifiManager
+import android.provider.Settings
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -28,12 +29,36 @@ class KdeConnectBroadcastReceiverTest {
 
     private fun nextStartedService(): Intent? = shadowOf(application).nextStartedService
 
+    private fun setBootCount(count: Int) {
+        Settings.Global.putInt(application.contentResolver, Settings.Global.BOOT_COUNT, count)
+    }
+
     @Test
     fun bootTurnsOffAndDoesNotStart() {
+        setBootCount(5)
         RunState.setOn(application, true)
+        setBootCount(6)
         receive(Intent.ACTION_BOOT_COMPLETED)
         assertFalse(RunState.isOn(application))
         assertNull(nextStartedService())
+    }
+
+    @Test
+    fun onFromPreviousBootIsOffEvenWithoutBootBroadcast() {
+        setBootCount(5)
+        RunState.setOn(application, true)
+        setBootCount(6) // the phone restarted; some OEMs never deliver BOOT_COMPLETED
+        assertFalse(RunState.isOn(application))
+        receive(Intent.ACTION_MY_PACKAGE_REPLACED)
+        assertNull(nextStartedService())
+    }
+
+    @Test
+    fun lateBootBroadcastKeepsOnFromThisBoot() {
+        setBootCount(6)
+        RunState.setOn(application, true) // the user opened the app before BOOT_COMPLETED arrived
+        receive(Intent.ACTION_BOOT_COMPLETED)
+        assertTrue(RunState.isOn(application))
     }
 
     @Test

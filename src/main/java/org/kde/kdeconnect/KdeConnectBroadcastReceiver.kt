@@ -30,7 +30,7 @@ class KdeConnectBroadcastReceiver : BroadcastReceiver() {
             Intent.ACTION_BOOT_COMPLETED -> {
                 Log.i("KdeConnect", "KdeConnectBroadcastReceiver")
                 // KDE Connect is always off after a phone restart, until the user opens it
-                RunState.setOn(context, false)
+                RunState.onBootCompleted(context)
             }
 
             WifiManager.SUPPLICANT_CONNECTION_CHANGE_ACTION, WifiManager.WIFI_STATE_CHANGED_ACTION, ConnectivityManager.CONNECTIVITY_ACTION -> {
