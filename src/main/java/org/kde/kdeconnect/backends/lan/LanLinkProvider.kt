@@ -259,7 +259,7 @@ class LanLinkProvider(private val context: Context) : BaseLinkProvider() {
 
     private fun configureSocket(socket: Socket) {
         try {
-            socket.setKeepAlive(true)
+            TcpKeepAlive.apply(socket)
             socket.setSoTimeout(10 * 1000)
         } catch (e: SocketException) {
             Log.e("LanLink", "Exception", e)
